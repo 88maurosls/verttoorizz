@@ -1,126 +1,192 @@
 import streamlit as st
 import pandas as pd
 import io
-from openpyxl.utils import column_index_from_string
 from PIL import Image
 
-# Funzione per trasporre taglie da un range di colonne
-def trasponi_taglie(file, colonna_inizio, colonna_fine, riga_header):
-    # Leggi il file Excel specificando la riga dell'header
-    df = pd.read_excel(file, engine="openpyxl", header=riga_header)
-    
-    # Converti i riferimenti delle colonne (lettere) in indici numerici
-    col_inizio_idx = column_index_from_string(colonna_inizio) - 1  # Indici 0-based
-    col_fine_idx = column_index_from_string(colonna_fine)          # Indici 0-based + 1 per includere la colonna fine
-    
-    # Separa le colonne delle taglie e quelle rimanenti
-    colonne_taglie = df.iloc[:, col_inizio_idx:col_fine_idx]  # Range di colonne per le taglie
-    altre_colonne = df.iloc[:, :col_inizio_idx].join(df.iloc[:, col_fine_idx:])  # Colonne fuori dal range
-    
-    # Crea una lista per il dataframe trasposto
-    righe = []
-    for _, row in df.iterrows():
-        for colonna in colonne_taglie.columns:
-            if not pd.isna(row[colonna]):  # Salta celle vuote
-                riga = row[:col_inizio_idx].to_dict()  # Copia valori prima del range
-                riga.update(row[col_fine_idx:].to_dict())  # Copia valori dopo il range
-                riga["Taglia"] = colonna  # Nome della colonna trasposta
-                riga["Quantità"] = row[colonna]  # Valore corrispondente
-                righe.append(riga)
-    
-    # Crea un nuovo dataframe
-    df_trasposto = pd.DataFrame(righe)
-    return df_trasposto
+def parse_size_series(s: pd.Series) -> pd.Series:
+    """
+    Converte Size in numero quando possibile:
+    - gestisce "6,5" -> 6.5
+    - gestisce spazi
+    - lascia NaN se non convertibile
+    """
+    s2 = s.astype(str).str.strip().str.replace(",", ".", regex=False)
+    s2 = s2.replace({"nan": None, "None": None, "": None})
+    return pd.to_numeric(s2, errors="coerce")
 
-# Inizializza session_state
-if 'file_elaborato' not in st.session_state:
-    st.session_state.file_elaborato = None
-if 'parametri_precedenti' not in st.session_state:
-    st.session_state.parametri_precedenti = None
+def to_wide(
+    df: pd.DataFrame,
+    sku_col: str,
+    size_col: str,
+    qty_col: str,
+    size_min: float | None = None,
+    size_max: float | None = None,
+    keep_only_numeric_sizes: bool = True,
+    add_tot: bool = True
+) -> pd.DataFrame:
+    # Copia di lavoro
+    d = df.copy()
 
-# Interfaccia Streamlit
-st.title("Trasposizione di Colonne Taglie in Verticale v.1.2")
-st.write("Carica il tuo file Excel e specifica il range di colonne da trasporre (es. taglie). Le altre colonne rimarranno invariate. NB: Eventuali filtri sul file di origine non verranno considerati e dovranno essere riapplicati sul nuovo file generato.")
+    # Colonne obbligatorie
+    for c in (sku_col, size_col, qty_col):
+        if c not in d.columns:
+            raise ValueError(f"Colonna non trovata: {c}")
 
-# Visualizza un'immagine di esempio
-st.markdown("### Esempio di input")
-try:
-    esempio_img = Image.open("eg.jpg")
-    st.image(esempio_img, caption="Esempio di file Excel", use_container_width=True)
-except FileNotFoundError:
-    st.error("Immagine di esempio non trovata. Assicurati che 'eg.jpg' sia nella directory principale.")
+    # Normalizza SKU
+    d[sku_col] = d[sku_col].astype(str).str.strip()
+    d = d[d[sku_col].notna() & (d[sku_col] != "")]
 
-# Caricamento del file Excel
-file = st.file_uploader("Carica il file Excel", type=["xlsx"])
+    # Quantità
+    d[qty_col] = pd.to_numeric(d[qty_col], errors="coerce").fillna(0).astype(int)
 
-# Input per specificare la riga dell'header
-riga_header_excel = st.number_input(
-    "Riga dell'header Excel (es. 1)", 
-    min_value=1, 
-    value=1, 
-    step=1,
-    help="Specifica in quale riga si trovano i nomi delle colonne (es. se in Excel è riga 7, inserisci 7)"
+    # Size
+    if keep_only_numeric_sizes:
+        d["_size_num"] = parse_size_series(d[size_col])
+        d = d[d["_size_num"].notna()]
+        if size_min is not None:
+            d = d[d["_size_num"] >= float(size_min)]
+        if size_max is not None:
+            d = d[d["_size_num"] <= float(size_max)]
+        size_key = "_size_num"
+    else:
+        d["_size_txt"] = d[size_col].astype(str).str.strip()
+        d = d[d["_size_txt"].notna() & (d["_size_txt"] != "")]
+        size_key = "_size_txt"
+
+    # Pivot: SKU una volta sola, taglie in orizzontale, somma qty
+    wide = (
+        d.pivot_table(
+            index=sku_col,
+            columns=size_key,
+            values=qty_col,
+            aggfunc="sum",
+            fill_value=0
+        )
+        .reset_index()
+    )
+
+    # Ordina colonne taglia
+    cols = list(wide.columns)
+    base = [sku_col]
+    size_cols = [c for c in cols if c not in base]
+
+    if keep_only_numeric_sizes:
+        size_cols_sorted = sorted(size_cols, key=lambda x: float(x))
+        # intestazioni più belle: 6 invece di 6.0
+        rename_map = {}
+        for c in size_cols_sorted:
+            v = float(c)
+            if abs(v - round(v)) < 1e-9:
+                rename_map[c] = int(round(v))
+            else:
+                rename_map[c] = v
+        wide = wide.rename(columns=rename_map)
+        # aggiorno lista size_cols dopo rename
+        size_cols_sorted = [rename_map[c] for c in size_cols_sorted]
+        ordered = base + size_cols_sorted
+        wide = wide[ordered]
+    else:
+        size_cols_sorted = sorted(size_cols)
+        wide = wide[base + size_cols_sorted]
+
+    # Totale riga
+    if add_tot:
+        # tutte le colonne tranne SKU
+        numeric_cols = [c for c in wide.columns if c != sku_col]
+        wide.insert(1, "TOT", wide[numeric_cols].sum(axis=1))
+
+    return wide
+
+
+# ---------------- UI ----------------
+st.title("Da verticale a orizzontale (SKU x Size) v.1.0")
+st.write(
+    "Carica un file Excel in formato verticale (es. colonne SKU, Size, qty) "
+    "e genera un file con le taglie in orizzontale e lo SKU una sola volta."
 )
 
-# Converti in indice 0-based per pandas
-riga_header = riga_header_excel - 1
-
-# Input per specificare il range di colonne
-colonna_inizio = st.text_input("Colonna inizio taglie (es. C)")
-colonna_fine = st.text_input("Colonna fine taglie (es. Y)")
-
-# Preview del range selezionato
-if file and colonna_inizio and colonna_fine:
+# (Opzionale) immagine esempio
+with st.expander("Mostra un esempio (opzionale)"):
     try:
-        st.markdown("### 📋 Preview del file")
-        
-        # Leggi il file con l'header specificato
-        df_preview = pd.read_excel(file, engine="openpyxl", header=riga_header)
-        
-        # Converti i riferimenti delle colonne in indici
-        col_inizio_idx = column_index_from_string(colonna_inizio) - 1
-        col_fine_idx = column_index_from_string(colonna_fine)
-        
-        # Mostra informazioni sul range
-        st.info(f"**Header dalla riga Excel:** {riga_header_excel} | **Range colonne:** {colonna_inizio} - {colonna_fine}")
-        
-        # Mostra tutto il dataframe
-        st.write(f"**Anteprima file completo ({len(df_preview)} righe):**")
-        st.dataframe(df_preview)
-        
-    except Exception as e:
-        st.warning(f"Impossibile mostrare la preview: {e}")
+        esempio_img = Image.open("eg.jpg")
+        st.image(esempio_img, caption="Esempio", use_container_width=True)
+    except FileNotFoundError:
+        st.info("Immagine 'eg.jpg' non trovata (puoi ignorare).")
 
-# Elabora e scarica con spinner
-if file and colonna_inizio and colonna_fine:
+file = st.file_uploader("Carica il file Excel", type=["xlsx"])
+
+riga_header_excel = st.number_input(
+    "Riga dell'header Excel (es. 1)",
+    min_value=1,
+    value=1,
+    step=1,
+    help="Se i nomi colonna stanno in Excel alla riga 7, inserisci 7."
+)
+header_idx = int(riga_header_excel) - 1
+
+if file:
     try:
-        # Crea una chiave univoca per i parametri correnti
-        parametri_correnti = f"{file.name}_{riga_header}_{colonna_inizio}_{colonna_fine}"
-        
-        # Elabora solo se i parametri sono cambiati
-        if st.session_state.parametri_precedenti != parametri_correnti:
-            # Mostra spinner durante l'elaborazione
-            with st.spinner('⏳ Elaborazione in corso... Sto trasponendo le taglie...'):
-                # Trasforma il file e crea il nuovo dataframe
-                nuovo_df = trasponi_taglie(file, colonna_inizio, colonna_fine, riga_header)
-                
-                # Salva in un file Excel temporaneo
+        df = pd.read_excel(file, engine="openpyxl", header=header_idx)
+        st.markdown("### Preview")
+        st.dataframe(df)
+
+        st.markdown("### Mappatura colonne")
+        cols = list(df.columns)
+
+        # Scelte con default intelligenti
+        def pick_default(options, candidates):
+            lower_map = {str(o).strip().lower(): o for o in options}
+            for c in candidates:
+                if c in lower_map:
+                    return lower_map[c]
+            return options[0] if options else None
+
+        sku_default = pick_default(cols, ["sku", "item code", "itemcode", "product", "codice"])
+        size_default = pick_default(cols, ["size", "taglia"])
+        qty_default = pick_default(cols, ["qty", "qty ", "quantity", "quantità", "quantita"])
+
+        sku_col = st.selectbox("Colonna SKU", cols, index=cols.index(sku_default) if sku_default in cols else 0)
+        size_col = st.selectbox("Colonna Size", cols, index=cols.index(size_default) if size_default in cols else 0)
+        qty_col = st.selectbox("Colonna Quantità", cols, index=cols.index(qty_default) if qty_default in cols else 0)
+
+        st.markdown("### Regole Size")
+        keep_only_numeric = st.checkbox("Considera solo size numeriche", value=True)
+        add_tot = st.checkbox("Aggiungi colonna TOT", value=True)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            size_min = st.number_input("Size minima (opzionale)", value=0.0, step=0.5) if keep_only_numeric else None
+        with c2:
+            size_max = st.number_input("Size massima (opzionale)", value=20.0, step=0.5) if keep_only_numeric else None
+
+        if st.button("Genera file con taglie in orizzontale"):
+            with st.spinner("Elaborazione in corso..."):
+                out_df = to_wide(
+                    df=df,
+                    sku_col=sku_col,
+                    size_col=size_col,
+                    qty_col=qty_col,
+                    size_min=size_min if keep_only_numeric else None,
+                    size_max=size_max if keep_only_numeric else None,
+                    keep_only_numeric_sizes=keep_only_numeric,
+                    add_tot=add_tot
+                )
+
+                st.success("File generato!")
+                st.markdown("### Anteprima output")
+                st.dataframe(out_df)
+
                 output = io.BytesIO()
                 with pd.ExcelWriter(output, engine="openpyxl") as writer:
-                    nuovo_df.to_excel(writer, index=False, sheet_name="Trasposizione")
+                    out_df.to_excel(writer, index=False, sheet_name="RESULT")
                 output.seek(0)
-                
-                # Salva in session_state
-                st.session_state.file_elaborato = output.getvalue()
-                st.session_state.parametri_precedenti = parametri_correnti
-        
-        # Mostra il pulsante di download
-        st.success("✅ File trasformato con successo!")
-        st.download_button(
-            label="📥 Scarica il file Excel trasformato",
-            data=st.session_state.file_elaborato,
-            file_name="trasposizione.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+
+                st.download_button(
+                    label="Scarica Excel (output)",
+                    data=output.getvalue(),
+                    file_name="pivot_taglie.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
     except Exception as e:
-        st.error(f"❌ Errore durante la trasformazione: {e}")
+        st.error(f"Errore durante la lettura o trasformazione: {e}")
